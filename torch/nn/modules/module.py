@@ -1494,7 +1494,7 @@ class Module:
     def _named_members(self, get_members_fn, prefix='', recurse=True, remove_duplicate=True):
         r"""Helper method for yielding various names + members of modules."""
         memo = set()
-        modules = self.named_modules(prefix=prefix) if recurse else [(prefix, self)]
+        modules = self.named_modules(prefix=prefix, remove_duplicate=remove_duplicate) if recurse else [(prefix, self)]
         for module_prefix, module in modules:
             members = get_members_fn(module)
             for k, v in members:
@@ -1589,9 +1589,9 @@ class Module:
             recurse (bool): if True, then yields buffers of this module
                 and all submodules. Otherwise, yields only buffers that
                 are direct members of this module.
-            remove_duplicate (bool): if True, then removes parameters
+            remove_duplicate (bool): if True, then removes buffers
                 that are duplicates of each other. For example, if two
-                parameters are tied, it'll only return one.
+                buffers are tied, it'll only return one.
 
         Yields:
             (string, torch.Tensor): Tuple containing the name and buffer
