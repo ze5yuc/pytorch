@@ -1328,6 +1328,7 @@ aten_cuda_cu_source_list = [
     "aten/src/ATen/native/cuda/BatchLinearAlgebra.cpp",
     "aten/src/ATen/native/cuda/BatchLinearAlgebraLib.cpp",
     "aten/src/ATen/native/cuda/Blas.cpp",
+    "aten/src/ATen/native/cuda/Distributions.cpp",
     "aten/src/ATen/native/cuda/Equal.cpp",
     "aten/src/ATen/native/cuda/GridSampler.cpp",
     "aten/src/ATen/native/cuda/IndexKernel.cpp",
