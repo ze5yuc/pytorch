@@ -1,5 +1,6 @@
 # Owner(s): ["oncall: distributed"]
 
+import copy
 import sys
 
 import torch
@@ -7,11 +8,13 @@ import torch.distributed as dist
 from torch.distributed._sharded_tensor import (
     empty,
     shard_parameter,
+    _collect_local_shard,
+    _reshard_output,
 )
 from torch.distributed._sharding_spec import (
     ChunkShardingSpec,
     EnumerableShardingSpec,
-    ShardMetadata
+    ShardMetadata,
 )
 from torch.distributed._sharded_optim import (
     ShardedOptimizer,
@@ -31,6 +34,7 @@ from torch.testing._internal.distributed._sharded_tensor import (
     with_comms,
 )
 from torch.testing._internal.distributed._sharded_tensor._test_ops_common import (
+    clone_module_parameter,
     generate_chunk_sharding_specs_for_test,
     generate_local_weight_sharding_params_for_test,
 )
@@ -44,16 +48,17 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestShardedTensorOpsLinear(ShardedTensorTestBase):
-    def _run_sharded_linear(self, spec, input_size, linear_size, sharded_dim):
+    def _run_sharded_linear(
+        self, spec, input_size, linear_size, sharded_dim, unstack_output=False,
+    ):
         # Use same seed.
         torch.manual_seed(0)
         local_linear = torch.nn.Linear(*linear_size).cuda(self.rank)
-
         sharded_linear = torch.nn.Linear(*linear_size)
 
         # Copy the weights and bias from local linear
-        sharded_linear.weight = torch.nn.Parameter(local_linear.weight.detach().clone())
-        sharded_linear.bias = torch.nn.Parameter(local_linear.bias.detach().clone())
+        sharded_linear.weight = clone_module_parameter(local_linear, "weight")
+        sharded_linear.bias = clone_module_parameter(local_linear, "bias")
 
         # Shard the parameter.
         shard_parameter(sharded_linear, "weight", spec)
@@ -61,7 +66,14 @@ class TestShardedTensorOpsLinear(ShardedTensorTestBase):
         # Run sharded computation
         torch.manual_seed(self.rank)  # inputs different on each rank
         inp = torch.rand(*input_size).cuda(self.rank)
+        reshard_spec = copy.deepcopy(spec)
+        reshard_spec.dim = 0
+        sharded_linear = _collect_local_shard(
+            _reshard_output(sharded_linear, reshard_spec)
+        )
         sharded_output = sharded_linear(inp)
+        if unstack_output:
+            sharded_output = torch.cat(torch.unbind(sharded_output))
 
         # Run local computation
         local_output = local_linear(inp)
@@ -76,6 +88,9 @@ class TestShardedTensorOpsLinear(ShardedTensorTestBase):
         sharded_output = torch.nn.functional.linear(
             inp, sharded_linear.weight, sharded_linear.bias
         )
+        sharded_output = sharded_output.reshard(reshard_spec).local_shard()
+        if unstack_output:
+            sharded_output = torch.cat(torch.unbind(sharded_output))
         self.assertEqual(local_output, sharded_output)
 
         # Compute loss and run backward pass.
@@ -94,9 +109,11 @@ class TestShardedTensorOpsLinear(ShardedTensorTestBase):
             local_linear.weight, sharded_dim, TEST_GPU_NUM, spec, self.rank
         )
         local_grad_narrowed = local_grad.narrow(sharded_dim, start_pos, chunk_size)
+        local_bias_grad = local_linear.bias.grad
+        dist.all_reduce(local_bias_grad)
 
         # Test backward gradient calculation.
-        self.assertEqual(sharded_linear.bias.grad, local_linear.bias.grad)
+        self.assertEqual(sharded_linear.bias.grad, local_bias_grad)
         self.assertEqual(sharded_weight.grad, local_grad_narrowed)
 
         # Test optimizer.
@@ -106,7 +123,11 @@ class TestShardedTensorOpsLinear(ShardedTensorTestBase):
         self.assertNotEqual(previous, local_linear.weight)
         previous_sharded_weight = sharded_weight.clone()
         previous_sharded_bias = sharded_linear.bias.clone()
-        sharded_optim = ShardedOptimizer(dict(named_params_with_sharded_tensor(sharded_linear)), torch.optim.SGD, lr=0.1)
+        sharded_optim = ShardedOptimizer(
+            dict(named_params_with_sharded_tensor(sharded_linear)),
+            torch.optim.SGD,
+            lr=0.1,
+        )
         sharded_optim.step()
         sharded_weight = sharded_linear.weight.local_shards()[0].tensor
         local_weight_narrowed = local_linear.weight.narrow(
@@ -135,10 +156,10 @@ class TestShardedTensorOpsLinear(ShardedTensorTestBase):
             self._run_sharded_linear(spec, [100, 12, 4, 15], [15, 14], 0)
 
             # Test single input dim
-            self._run_sharded_linear(spec, [17], [17, 12], 0)
-            self._run_sharded_linear(spec, [21], [21, 11], 0)
-            self._run_sharded_linear(spec, [23], [23, 13], 0)
-            self._run_sharded_linear(spec, [15], [15, 14], 0)
+            self._run_sharded_linear(spec, [17], [17, 12], 0, True)
+            self._run_sharded_linear(spec, [21], [21, 11], 0, True)
+            self._run_sharded_linear(spec, [23], [23, 13], 0, True)
+            self._run_sharded_linear(spec, [15], [15, 14], 0, True)
 
     @with_comms(init_rpc=False)
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
@@ -169,7 +190,7 @@ class TestShardedTensorOpsLinear(ShardedTensorTestBase):
         for spec in generate_chunk_sharding_specs_for_test(0):
             fc1 = torch.nn.Linear(10, 10).cuda(self.rank)
             shard_parameter(fc1, "bias", spec)
-            with self.assertRaisesRegex(TypeError, 'input and bias need to be torch.Tensor'):
+            with self.assertRaisesRegex(TypeError, 'bias needs to be torch.Tensor'):
                 fc1(torch.rand(10, 10).cuda(self.rank))
 
             fc2 = torch.nn.Linear(10, 10).cuda(self.rank)
